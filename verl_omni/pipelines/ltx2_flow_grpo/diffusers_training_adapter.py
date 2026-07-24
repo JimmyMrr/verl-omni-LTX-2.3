@@ -103,24 +103,30 @@ class LTX23FlowGRPO(DiffusionModelBase):
         latent_width = model_config.pipeline.width // 32
         frame_rate = model_config.pipeline.frame_rate
 
+        B = video_latents.shape[0]
+        C = video_latents.shape[2]
+        video_latents_5d = video_latents.reshape(B, latent_frames, latent_height, latent_width, C).permute(0, 4, 1, 2, 3)
+
+        audio_C = 8
+        audio_mel_bins = 16
+        audio_latents_4d = audio_latents.reshape(B, -1, audio_C, audio_mel_bins).permute(0, 2, 1, 3)
+
+        # VeOmni's LTX2VideoTransformer3DModel.forward expects per-sample lists
+        # (list length == batch size, each element with batch dim == 1). Passing a
+        # bare tensor makes ``zip`` iterate the batch dimension, yielding 4D
+        # tensors and triggering ``IndexError: tuple index out of range``.
+        timestep_list = [timestep[i : i + 1] for i in range(B)]
         common = {
-            "hidden_states": video_latents,
-            "audio_hidden_states": audio_latents,
-            "timestep": timestep,
-            "sigma": timestep,
-            "num_frames": latent_frames,
-            "height": latent_height,
-            "width": latent_width,
-            "fps": frame_rate,
-            "audio_num_frames": audio_latents.shape[1],
-            "return_dict": False,
+            "hidden_states": [video_latents_5d[i : i + 1] for i in range(B)],
+            "audio_hidden_states": [audio_latents_4d[i : i + 1] for i in range(B)],
+            "timestep": timestep_list,
+            "audio_timestep": timestep_list,
+            "fps": [frame_rate] * B,
         }
         model_inputs = {
             **common,
-            "encoder_hidden_states": prompt_embeds,
-            "audio_encoder_hidden_states": micro_batch["audio_prompt_embeds"],
-            "encoder_attention_mask": prompt_embeds_mask,
-            "audio_encoder_attention_mask": prompt_embeds_mask,
+            "encoder_hidden_states": [prompt_embeds[i : i + 1] for i in range(B)],
+            "audio_encoder_hidden_states": [micro_batch["audio_prompt_embeds"][i : i + 1] for i in range(B)],
         }
 
         guidance_scale = model_config.pipeline.guidance_scale or 1.0
@@ -132,18 +138,37 @@ class LTX23FlowGRPO(DiffusionModelBase):
             raise KeyError("LTX-2.3 CFG requires `negative_audio_prompt_embeds` from rollout.")
         negative_model_inputs = {
             **common,
-            "encoder_hidden_states": negative_prompt_embeds,
-            "audio_encoder_hidden_states": micro_batch["negative_audio_prompt_embeds"],
-            "encoder_attention_mask": negative_prompt_embeds_mask,
-            "audio_encoder_attention_mask": negative_prompt_embeds_mask,
+            "encoder_hidden_states": [negative_prompt_embeds[i : i + 1] for i in range(B)],
+            "audio_encoder_hidden_states": [
+                micro_batch["negative_audio_prompt_embeds"][i : i + 1] for i in range(B)
+            ],
         }
         return model_inputs, negative_model_inputs
 
     @staticmethod
     def _predict(module: ModelMixin, model_inputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the LTX transformer and return float32 video/audio velocities."""
-        video_pred, audio_pred = module(**model_inputs)
-        return video_pred.float(), audio_pred.float()
+        """Run the LTX transformer and return float32 video/audio velocities in 3D format."""
+        output = module(**model_inputs)
+        if isinstance(output, tuple):
+            video_pred, audio_pred = output
+        else:
+            preds = output.predictions or []
+            video_pred = torch.cat(preds, dim=0) if preds else preds
+            audio_preds = output.audio_predictions or []
+            audio_pred = torch.cat(audio_preds, dim=0) if audio_preds else None
+        
+        video_pred = video_pred.float()
+        audio_pred = audio_pred.float() if audio_pred is not None else None
+        
+        if video_pred.ndim == 5:
+            B, C, F, H, W = video_pred.shape
+            video_pred = video_pred.permute(0, 2, 3, 4, 1).reshape(B, F * H * W, C)
+        
+        if audio_pred is not None and audio_pred.ndim == 4:
+            B, C, F, M = audio_pred.shape
+            audio_pred = audio_pred.permute(0, 2, 1, 3).reshape(B, F, C * M)
+        
+        return video_pred, audio_pred
 
     @classmethod
     def forward_and_sample_previous_step(
@@ -160,16 +185,27 @@ class LTX23FlowGRPO(DiffusionModelBase):
         if scheduler_inputs is None:
             raise ValueError("LTX-2.3 FlowGRPO requires rollout scheduler inputs.")
 
-        video_latents = model_inputs["hidden_states"].float()
-        audio_latents = model_inputs["audio_hidden_states"].float()
+        # ``model_inputs["hidden_states"]`` (and friends) are per-sample lists
+        # built in ``prepare_model_inputs`` because VeOmni's transformer
+        # expects that format. Rebatch them into single tensors here.
+        video_latents = torch.cat(model_inputs["hidden_states"], dim=0).float()
+        audio_latents = torch.cat(model_inputs["audio_hidden_states"], dim=0).float()
         video_pred, audio_pred = cls._predict(module, model_inputs)
+
+        if video_latents.ndim == 5:
+            B, C, F, H, W = video_latents.shape
+            video_latents = video_latents.permute(0, 2, 3, 4, 1).reshape(B, F * H * W, C)
+        
+        if audio_latents.ndim == 4:
+            B, C, F, M = audio_latents.shape
+            audio_latents = audio_latents.permute(0, 2, 1, 3).reshape(B, F, C * M)
 
         guidance_scale = model_config.pipeline.guidance_scale or 1.0
         if guidance_scale > 1.0:
             if negative_model_inputs is None:
                 raise ValueError("LTX-2.3 CFG requires negative model inputs.")
             negative_video_pred, negative_audio_pred = cls._predict(module, negative_model_inputs)
-            sigma = (model_inputs["timestep"].float() / 1000.0).view(-1, 1, 1)
+            sigma = (torch.cat(model_inputs["timestep"], dim=0).float() / 1000.0).view(-1, 1, 1)
             video_pred = apply_x0_cfg(video_latents, video_pred, negative_video_pred, sigma, guidance_scale)
             audio_pred = apply_x0_cfg(audio_latents, audio_pred, negative_audio_pred, sigma, guidance_scale)
 

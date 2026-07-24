@@ -123,6 +123,7 @@ All example scripts in this directory:
 | Variant | Script | GPUs | Notes |
 |---------|--------|------|-------|
 | T2AV LoRA | `ltx2/run_ltx2_3_t2av_lora.sh` | 8×GPU | Joint audio-video CPS, CLAP + ImageBind rewards |
+| T2AV VeOmni | `ltx2/run_ltx2_3_t2av_veomni.sh` | 8×GPU | Full-weight VeOmni engine; param/optimizer offload |
 
 ### BAGEL
 
