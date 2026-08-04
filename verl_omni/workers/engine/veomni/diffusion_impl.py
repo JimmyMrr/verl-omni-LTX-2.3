@@ -590,14 +590,16 @@ class VeOmniDiffusionEngine(BaseEngine):
         if self.model_config.lora_rank > 0 or self.model_config.lora_adapter_path is not None:
             raise NotImplementedError("VeOmni diffusion backend does not support LoRA weight export yet.")
 
-        # Only load model to GPU when params are offloaded to CPU.
         # When param_offload=False, params already reside on NPU as FSDP2
-        # shards. Calling ``load_model_to_gpu`` (→ ``model.to(device)``)
-        # unconditionally would trigger FSDP2 unshard and leave full params
-        # resident on every rank, destroying the shard state and causing OOM
-        # in the subsequent backward pass.
-        if self._is_offload_param:
-            load_model_to_gpu(self.module, get_device_id())
+        # shards. ``state_dict`` returns DTensors that ``full_tensor()``
+        # can gather lazily, one parameter at a time.
+        #
+        # When param_offload=True, params are on CPU.  We must NOT call
+        # ``load_model_to_gpu`` (→ ``model.to(device)``) because that
+        # triggers FSDP2 unshard of *all* layers at once, exceeding GPU
+        # memory when the rollout engine is co-located.  Instead, keep
+        # params on CPU and let ``full_tensor()`` gather each parameter
+        # individually before moving it to GPU in the generator below.
         params = self.module.state_dict(keep_vars=True)
         # Skip ``convert_weight_keys`` for VeOmni models: their
         # ``_checkpoint_conversion_mapping`` (e.g. ``{"^model\\.diffusion_model\\.":
@@ -610,9 +612,6 @@ class VeOmniDiffusionEngine(BaseEngine):
         # that the rollout loader cannot match.  The VeOmni state-dict keys are
         # already in the correct format; the rollout adapter's
         # ``_remap_veomni_key`` handles any remaining VeOmni→diffusers renaming.
-
-        if self._is_offload_param:
-            offload_model_to_cpu(self.module)
 
         device = get_device_id()
         export_dtype = PrecisionType.to_dtype(self.engine_config.model_dtype)

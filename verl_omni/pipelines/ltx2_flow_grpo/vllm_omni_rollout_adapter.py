@@ -53,6 +53,10 @@ _VEOMNI_TO_DIFFUSERS_KEY_MAP = [
     ("adaln_single.", "time_embed."),
     ("scale_shift_table_a2v_ca_audio", "audio_a2v_cross_attn_scale_shift_table"),
     ("scale_shift_table_a2v_ca_video", "video_a2v_cross_attn_scale_shift_table"),
+    ("q_norm", "norm_q"),
+    ("k_norm", "norm_k"),
+    ("audio_patchify_proj", "audio_proj_in"),
+    ("patchify_proj", "proj_in"),
 ]
 
 
